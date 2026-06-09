@@ -1,0 +1,1385 @@
+# FinTwit Newsletter Agent — Claude Code Build Prompt
+
+## Mission
+
+Build a Python-based financial news monitoring agent that continuously ingests data from X (Twitter), financial news APIs, and macro/earnings calendars — scores each item for market impact — and when a significance threshold is crossed, auto-drafts a concise newsletter via the Claude API and delivers it to the user.
+
+The system should be modular, self-contained, and runnable on a single machine (or a small VPS). Prefer simplicity over scale. SQLite over Postgres. Cron over Kafka.
+
+**Hard constraints:**
+- All API calls must be FREE. No paid tiers. If a free option dies, fail gracefully and fall back to the next source.
+- X data comes from a curated list of ~15–20 specific accounts, not broad search. This keeps volume low and signal high.
+- Primary delivery is Telegram (real-time alerts) + a local web dashboard (monitoring). Email is secondary for daily digests.
+
+---
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        DATA SOURCES                             │
+├──────────────┬──────────────┬──────────────┬────────────────────┤
+│  X / Twitter │  News APIs   │ FOMC / Macro │ Earnings Calendar  │
+│  (curated    │  (Finnhub,   │ (Fed site,   │ (Finnhub, Alpha   │
+│   accounts)  │   Polygon,   │  Finnhub     │  Vantage, manual   │
+│              │   NewsAPI)   │  econ cal)   │  watchlist)        │
+└──────┬───────┴──────┬───────┴──────┬───────┴────────┬───────────┘
+       │              │              │                │
+       ▼              ▼              ▼                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    INGEST & NORMALIZE LAYER                     │
+│  - Fetch raw data from each source                              │
+│  - Convert to unified NewsItem schema                           │
+│  - Deduplicate (fuzzy match headlines within 5-min window)      │
+│  - Tag tickers ($AAPL, $TSLA) and macro topics                  │
+│  - Store in SQLite                                              │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      SCORING / TRIGGER ENGINE                   │
+│  - Assign urgency_score to each item (0.0 – 1.0)               │
+│  - Check velocity signals (RT speed, cluster density)           │
+│  - Check content signals (keyword/NLP classification)           │
+│  - Check market signals (futures move, VIX spike)               │
+│  - If composite score > threshold → trigger newsletter draft    │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    NEWSLETTER DRAFT (Claude API)                │
+│  - Assemble context window from top-scored items                │
+│  - Include upcoming FOMC / earnings context if relevant         │
+│  - Call Claude API with newsletter system prompt                 │
+│  - Output: markdown newsletter ready to send                    │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       DELIVERY LAYER                            │
+│  1. Telegram bot (primary — real-time push alerts)              │
+│  2. Local web dashboard (monitoring + history)                  │
+│  3. Email / SMTP (daily digest, optional)                       │
+│  4. Local file dump (fallback, always on)                       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Project Structure
+
+```
+fintwit-agent/
+├── config/
+│   ├── settings.py          # All env vars, API keys, thresholds
+│   ├── watchlist.py          # Ticker watchlist + priority tiers
+│   └── accounts.py           # X accounts to track (curated list)
+├── ingest/
+│   ├── __init__.py
+│   ├── x_ingest.py           # Multi-strategy X scraper (syndication → Apify → Scweet)
+│   ├── news_ingest.py        # Finnhub, Polygon, NewsAPI, EODHD
+│   ├── calendar_ingest.py    # FOMC dates, earnings calendar
+│   └── normalizer.py         # Raw → unified NewsItem schema
+├── scoring/
+│   ├── __init__.py
+│   ├── tagger.py             # Ticker extraction + topic classification
+│   ├── dedup.py              # Fuzzy dedup within time windows
+│   ├── velocity.py           # RT velocity, cluster density scoring
+│   ├── content.py            # Keyword + NLP-based content scoring
+│   ├── market.py             # Price/VIX/yield cross-reference scoring
+│   └── engine.py             # Composite scorer + trigger logic
+├── newsletter/
+│   ├── __init__.py
+│   ├── assembler.py          # Build context window for Claude
+│   ├── drafter.py            # Claude API call + prompt template
+│   └── templates.py          # System prompts for different newsletter types
+├── delivery/
+│   ├── __init__.py
+│   ├── telegram_bot.py       # Primary: real-time push alerts
+│   ├── web_dashboard.py      # Local Flask/FastAPI dashboard
+│   ├── email_sender.py       # Daily digest via SMTP
+│   └── file_dump.py          # Always-on fallback
+├── db/
+│   ├── schema.sql
+│   └── store.py              # SQLite helper (insert, query, dedup check)
+├── main.py                   # Entry point — orchestrates the loop
+├── scheduler.py              # Market-hours-aware adaptive polling
+├── requirements.txt
+├── .env.example
+└── README.md
+```
+
+---
+
+## 1. Data Sources — Detailed Specs
+
+### 1A. X / Twitter Ingestion (`ingest/x_ingest.py`)
+
+#### The Free X Data Problem (as of mid-2026)
+
+X's official API is effectively paywalled for read access:
+- **Free tier**: write-only (1,500 posts/mo). Cannot read tweets, timelines, or search. Useless for monitoring.
+- **Basic tier ($200/mo)**: ~10,000 reads/month. Unacceptable for a free-only constraint.
+- **Pro tier ($5,000/mo)**: overkill.
+
+But since we're tracking only ~15 specific accounts (not doing broad search), we have viable free alternatives.
+
+#### Free X Ingestion Strategy — Tiered Fallback Chain
+
+The system uses a multi-strategy approach. Each tier is tried in order; if one fails, fall to the next.
+
+```python
+# TIER 1 (Primary): Twitter Syndication API — direct HTTP, no auth, truly free
+#
+# Twitter's embed/widget system uses a public Syndication API:
+#   https://syndication.twitter.com/srv/timeline-profile/screen-name/{username}
+#
+# Returns the ~20 most recent tweets from a public profile.
+# No API key, no auth token, no cookies needed.
+# Includes: tweet text, timestamp, basic engagement (likes, RTs, replies).
+#
+# Python wrapper: `twittxr` (Node.js) or replicate the HTTP call directly.
+# The endpoint is the same one Twitter's embedded widgets use.
+#
+# Limitations:
+#   - Only ~20 most recent tweets per call (fine for polling every 2 min)
+#   - No search capability (we don't need it — we know exactly which accounts)
+#   - Accounts under ~10K followers may return empty (all our targets are above this)
+#   - Can get rate-limited under heavy polling; back off with exponential delay
+#   - Returns "popular" tweets, not strictly chronological (usually close enough)
+#
+# Why this works for us:
+#   15 accounts × 1 request each × every 2 minutes during market hours
+#   = 15 requests per cycle, ~450/hour, ~3,600/day
+#   Well within Syndication API's undocumented rate limits.
+#
+# Implementation:
+import requests
+from datetime import datetime
+
+def fetch_syndication_timeline(username: str) -> list[dict]:
+    """Fetch recent tweets via Twitter's public Syndication API."""
+    url = f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{username}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/xhtml+xml",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        # Parse the HTML response to extract tweet data
+        # The page contains embedded JSON in script tags
+        # Use BeautifulSoup to extract the tweet objects
+        return parse_syndication_html(resp.text)
+    except Exception as e:
+        logger.warning(f"Syndication API failed for @{username}: {e}")
+        return []
+
+
+# TIER 2 (Fallback): Apify Free Tier — $5/mo credit, ~1,600 tweets/month
+#
+# Multiple Apify "Actors" can scrape X timelines:
+#   - "gentle_cloud/x-twitter-public-data-scraper" — uses Syndication + FXTwitter, no auth
+#   - "cryptosignals/twitter-scraper" — multi-strategy (GraphQL + Syndication + Nitter)
+#   - "sovereigntaylor/twitter-scraper" — Syndication + Nitter + direct crawl
+#   - "parseforge/x-com-scraper" — GraphQL, no login, up to 100 tweets
+#
+# Use Apify's REST API to trigger actor runs programmatically:
+#   POST https://api.apify.com/v2/acts/{actorId}/runs
+#   GET  https://api.apify.com/v2/datasets/{datasetId}/items
+#
+# Budget: $5 free credit ÷ ~$0.003/tweet = ~1,600 tweets/month
+# Strategy: Reserve Apify for when Syndication API fails or for engagement
+# metric re-checks (the velocity scoring second-pass).
+#
+# NOTE: Some actors require cookies from a logged-in X session for
+# full timeline access. Profiles-only mode (no search) works without.
+
+
+# TIER 3 (Fallback): Scweet — Python library, uses your browser cookies
+#
+# pip install scweet
+# Uses X's internal GraphQL API via your browser's auth cookie.
+# Free and unlimited, but:
+#   - Requires a real X account's auth_token (extract from browser DevTools)
+#   - Risk of account suspension if X detects automated access
+#   - Cookies expire every few weeks; must refresh manually
+#
+# Best used as a fallback, not primary. Good for backfill jobs.
+#
+# from Scweet import Scweet
+# s = Scweet(auth_token="your_auth_token_from_browser")
+# tweets = s.get_profile_tweets(["DeItaone", "FirstSquawk"], limit=20)
+
+
+# TIER 4 (Last resort): FXTwitter / FixTweet API
+#
+# Originally built for Discord/Telegram embeds. Exposes tweet data as JSON:
+#   https://api.fxtwitter.com/{username}/status/{tweet_id}
+#   https://api.vxtwitter.com/{username}/status/{tweet_id}
+#
+# Limitation: Requires knowing the tweet ID. Can't list a user's timeline.
+# Useful for enriching a tweet you already know about (e.g., from Syndication
+# which gave you the ID but incomplete engagement data).
+```
+
+#### Curated Account List (`config/accounts.py`)
+
+These are the specific accounts to monitor. Split into categories by what they provide.
+
+```python
+# ═══════════════════════════════════════════════════════
+# WIRE ACCOUNTS — Breaking headlines, fastest signal
+# These post the same content as Bloomberg/Reuters terminals
+# ═══════════════════════════════════════════════════════
+WIRE_ACCOUNTS = [
+    "DeItaone",         # Breaking macro headlines (Fed, CPI, NFP, geopolitics). ALL-CAPS = breaking.
+    "FirstSquawk",      # Real-time market-moving squawk. Very fast on Fed/data releases.
+    "LiveSquawk",       # Live financial squawk box. Overlaps with FirstSquawk.
+    "FinancialJuice",   # Economic data releases, central bank decisions globally.
+]
+
+# ═══════════════════════════════════════════════════════
+# ANALYSIS & MACRO — Deeper context, not just headlines
+# These accounts add interpretation and framing
+# ═══════════════════════════════════════════════════════
+ANALYSIS_ACCOUNTS = [
+    "KosBeissiLetter",  # The Kobeissi Letter. Macro analysis, market context, charts.
+    "Serenity_Res",     # Serenity Research. Deep fundamental analysis.
+    "TheValuist",       # Valuation-focused analysis, contrarian takes.
+    "jukan_05",         # Markets commentary, global macro.
+    "MacroAlf",         # Alfonso Peccatiello. Macro strategy, rates, liquidity.
+    "unusual_whales",   # Unusual options activity, political trades, flow data.
+    "zaborhedge",       # ZeroHedge-adjacent breaking alerts, contrarian macro.
+]
+
+# ═══════════════════════════════════════════════════════
+# INSTITUTIONAL / MEDIA — Established outlets on X
+# Slower but more reliable and comprehensive
+# ═══════════════════════════════════════════════════════
+MEDIA_ACCOUNTS = [
+    "business",         # Bloomberg headlines.
+    "ReutersBiz",       # Reuters business wire.
+    "financialtimes",   # FT headlines.
+    "WSJ",              # Wall Street Journal.
+    "Markets",          # Bloomberg Markets.
+]
+
+# ═══════════════════════════════════════════════════════
+# All accounts combined for the polling loop
+# ═══════════════════════════════════════════════════════
+ALL_ACCOUNTS = WIRE_ACCOUNTS + ANALYSIS_ACCOUNTS + MEDIA_ACCOUNTS
+
+# Account metadata for scoring
+ACCOUNT_RELIABILITY = {
+    # Wire accounts get a credibility boost (they rarely post noise)
+    "DeItaone": {"tier": "wire", "credibility": 0.95, "speed": "fastest"},
+    "FirstSquawk": {"tier": "wire", "credibility": 0.95, "speed": "fastest"},
+    "LiveSquawk": {"tier": "wire", "credibility": 0.90, "speed": "fast"},
+    "FinancialJuice": {"tier": "wire", "credibility": 0.90, "speed": "fast"},
+
+    # Analysis accounts — high signal but slower
+    "KobeissiLetter": {"tier": "analysis", "credibility": 0.85, "speed": "medium"},
+    "Serenity_Res": {"tier": "analysis", "credibility": 0.85, "speed": "medium"},
+    "TheValuist": {"tier": "analysis", "credibility": 0.80, "speed": "medium"},
+    "jukan_05": {"tier": "analysis", "credibility": 0.80, "speed": "medium"},
+    "MacroAlf": {"tier": "analysis", "credibility": 0.85, "speed": "medium"},
+    "unusual_whales": {"tier": "analysis", "credibility": 0.75, "speed": "fast"},
+    "zaborhedge": {"tier": "analysis", "credibility": 0.70, "speed": "fast"},
+
+    # Media — reliable but slowest
+    "business": {"tier": "media", "credibility": 0.90, "speed": "slow"},
+    "ReutersBiz": {"tier": "media", "credibility": 0.95, "speed": "slow"},
+    "financialtimes": {"tier": "media", "credibility": 0.90, "speed": "slow"},
+    "WSJ": {"tier": "media", "credibility": 0.90, "speed": "slow"},
+    "Markets": {"tier": "media", "credibility": 0.85, "speed": "slow"},
+}
+
+# NOTE: Verify all handles are correct before first run.
+# X handles change. Some accounts get suspended. Some rebrand.
+# The system should log a warning if a handle returns 0 tweets for 3+ consecutive cycles.
+```
+
+### 1B. Financial News APIs (`ingest/news_ingest.py`)
+
+All endpoints below are free tier. The news APIs serve as the PRIMARY content source (reliable, structured, always-on). X data is the SECONDARY engagement/velocity layer on top.
+
+```python
+# Finnhub (free: 60 calls/min — most generous free tier)
+# GET https://finnhub.io/api/v1/news?category=general&token=YOUR_KEY
+# GET https://finnhub.io/api/v1/company-news?symbol=AAPL&from=2026-06-01&to=2026-06-09&token=YOUR_KEY
+# Returns: headline, summary, source, url, datetime, related tickers
+
+# Polygon.io (free: 5 calls/min — good for ticker-specific news)
+# GET https://api.polygon.io/v2/reference/news?limit=50&apiKey=YOUR_KEY
+# GET https://api.polygon.io/v2/reference/news?ticker=AAPL&apiKey=YOUR_KEY
+# Returns: title, description, article_url, tickers, published_utc
+
+# Alpha Vantage (free: 25 calls/day — use ONLY for sentiment scoring)
+# GET https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers=AAPL&apikey=YOUR_KEY
+# Returns: title, summary, source, overall_sentiment_score, ticker_sentiment
+# STRATEGY: Don't waste on general news. Use specifically when a Tier 1 stock is
+# in the news and you want a sentiment score to include in the newsletter.
+
+# NewsAPI.org (free for dev: 100 req/day, headlines only, 24h delay on articles)
+# GET https://newsapi.org/v2/top-headlines?category=business&language=en&apiKey=YOUR_KEY
+# Returns: title, description, url, publishedAt, source
+# NOTE: Free tier doesn't allow production use. Fine for personal monitoring.
+
+# EODHD (free: 20 calls/day — supplement only)
+# GET https://eodhd.com/api/news?s=AAPL.US&api_token=YOUR_KEY
+# Returns: title, content, link, symbols
+```
+
+**Polling schedule (market-hours aware):**
+- Finnhub general news: every 2 minutes during market hours, every 10 min off-hours
+- Finnhub company news for watchlist tickers: every 5 minutes, cycle through tickers
+- Polygon news: every 5 minutes during market hours
+- Alpha Vantage: 2x/day max (morning + afternoon), reserved for sentiment enrichment
+- NewsAPI: every 15 minutes
+- EODHD: every 30 minutes
+
+### 1C. FOMC & Macro Calendar (`ingest/calendar_ingest.py`)
+
+```python
+# Finnhub Economic Calendar (free)
+# GET https://finnhub.io/api/v1/calendar/economic?token=YOUR_KEY
+# Filter for high-impact events: FOMC, CPI, PPI, NFP, GDP, PCE, Retail Sales, ISM
+
+# Hardcoded FOMC 2026 dates (update annually from federalreserve.gov)
+# These are the meeting conclusion dates (statement released at 2:00 PM ET):
+FOMC_DATES_2026 = [
+    "2026-01-28",  # Jan meeting
+    "2026-03-18",  # Mar meeting (with SEP/dot plot) ★
+    "2026-05-06",  # May meeting
+    "2026-06-17",  # Jun meeting (with SEP/dot plot) ★
+    "2026-07-29",  # Jul meeting
+    "2026-09-16",  # Sep meeting (with SEP/dot plot) ★
+    "2026-11-04",  # Nov meeting
+    "2026-12-16",  # Dec meeting (with SEP/dot plot) ★
+]
+# NOTE: These are illustrative — verify against the actual Fed schedule.
+# Meetings marked ★ include Summary of Economic Projections → higher impact.
+# Minutes release: 3 weeks after each meeting (lower impact but still notable).
+
+# Pre-FOMC alert logic:
+# - T-24h: include "FOMC tomorrow" context in any triggered newsletter
+# - T-0 + 30min (after 2:00 PM ET release): force-trigger a newsletter
+# - On SEP meetings: flag as higher importance in the template
+```
+
+### 1D. Earnings Calendar (`ingest/calendar_ingest.py`)
+
+```python
+# Finnhub Earnings Calendar (free)
+# GET https://finnhub.io/api/v1/calendar/earnings?from=2026-06-09&to=2026-06-20&token=YOUR_KEY
+# Returns: date, epsActual, epsEstimate, hour (bmo/amc), revenueActual, revenueEstimate, symbol
+
+# Alpha Vantage Earnings Calendar (free, CSV format)
+# GET https://www.alphavantage.co/query?function=EARNINGS_CALENDAR&horizon=3month&apikey=YOUR_KEY
+```
+
+**Watchlist tiers** — define in `config/watchlist.py`:
+
+```python
+# Tier 1: Mega-caps that move the entire market
+# Always trigger newsletter on ANY earnings release
+TIER_1 = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOG", "META", "TSLA", "BRK.B"]
+
+# Tier 2: Sector bellwethers
+# Trigger newsletter only on significant surprise (>5% EPS miss/beat)
+TIER_2 = [
+    "JPM", "GS", "BAC",    # Financials
+    "UNH", "JNJ", "LLY",   # Healthcare
+    "XOM", "CVX",           # Energy
+    "HD", "WMT", "COST",   # Consumer
+    "CRM", "ORCL", "ADBE", # Enterprise software
+    "AVGO", "TSM", "AMD",  # Semiconductors
+    "BA", "CAT", "UNP",    # Industrials
+    "DIS", "NFLX",         # Media
+]
+
+# Tier 3: User's personal watchlist (loaded from .env)
+# Trigger newsletter only if combined with other signals
+TIER_3 = []  # Populated from WATCHLIST_TIER_3 env var
+
+# Earnings alert logic:
+# - T-24h before Tier 1 earnings: include "AAPL reports tomorrow AMC" in newsletter context
+# - On Tier 1 earnings release: force-trigger newsletter immediately
+# - On Tier 2 earnings: trigger only if EPS surprise > 5% or revenue surprise > 3%
+# - On Tier 3 earnings: include in next batch/digest only
+```
+
+---
+
+## 2. Adaptive Polling — Market-Hours Aware (`scheduler.py`)
+
+**Do NOT use fixed-interval polling.** The system should be aware of market hours and escalate its own polling frequency when activity spikes.
+
+### Time-Based Polling Schedule
+
+```python
+import pytz
+from datetime import datetime, time
+
+ET = pytz.timezone("US/Eastern")
+
+def get_poll_interval() -> int:
+    """Return polling interval in seconds based on current market time."""
+    now = datetime.now(ET)
+    t = now.time()
+    weekday = now.weekday()  # 0=Mon, 6=Sun
+
+    # Weekends: low frequency (geopolitical events still happen)
+    if weekday >= 5:
+        return 1800  # 30 min
+
+    # US pre-market (4:00 AM – 9:30 AM ET)
+    if time(4, 0) <= t < time(9, 30):
+        return 120  # 2 min
+
+    # Market open — highest frequency (9:30 AM – 4:00 PM ET)
+    if time(9, 30) <= t < time(16, 0):
+        return 60  # 1 min
+
+    # After-hours / earnings window (4:00 PM – 8:00 PM ET)
+    if time(16, 0) <= t < time(20, 0):
+        return 90  # 1.5 min
+
+    # Overnight (8:00 PM – 4:00 AM ET)
+    return 600  # 10 min
+```
+
+### Adaptive Escalation — Speed Up When Things Get Hot
+
+```python
+# The system has three states: NORMAL, ELEVATED, CRITICAL
+# State transitions based on scoring output from the most recent cycle.
+
+class PollState:
+    NORMAL = "normal"       # Use time-based schedule above
+    ELEVATED = "elevated"   # Override to 20-second polling
+    CRITICAL = "critical"   # Override to 10-second polling
+
+# Transition rules:
+#
+# NORMAL → ELEVATED when:
+#   - Any single item scores urgency > 0.6
+#   - OR 2+ items from different sources about the same topic in one cycle
+#
+# ELEVATED → CRITICAL when:
+#   - Any single item scores urgency > 0.85
+#   - OR cluster_density >= 3 (3+ accounts posting about the same thing within 3 min)
+#   - OR VIX spikes > 10% (from market data cross-reference)
+#   - OR force-trigger event (FOMC release, Tier 1 earnings drop)
+#
+# Any state → NORMAL when:
+#   - 15 minutes pass with no item scoring above 0.5
+#
+# ELEVATED and CRITICAL states have a max duration of 30 minutes.
+# After 30 min, auto-decay back to NORMAL regardless.
+```
+
+### RT Velocity — Two-Pass Check (not fixed polling)
+
+The engagement spike detection is NOT based on fixed-period polling. It uses a two-pass approach:
+
+```python
+# PASS 1 (at ingest time):
+#   Record engagement metrics when tweet is first seen.
+#   Store: {tweet_id, likes_t0, rts_t0, replies_t0, first_seen_at}
+
+# PASS 2 (3–5 minutes later):
+#   Re-fetch the same tweet's engagement metrics.
+#   Calculate velocity: rt_velocity = (rts_t1 - rts_t0) / elapsed_minutes
+#
+#   This is scheduled as a delayed task, not a separate poll cycle.
+#   Only tweets that score > 0.3 on content_score get a velocity re-check.
+#   (No point re-checking a random lifestyle tweet.)
+#
+#   Velocity thresholds:
+#     > 100 RT/min → velocity_score = 1.0 (viral breaking news)
+#     > 50 RT/min  → velocity_score = 0.8
+#     > 20 RT/min  → velocity_score = 0.6
+#     > 10 RT/min  → velocity_score = 0.4
+#     < 10 RT/min  → velocity_score = 0.2
+#
+# WHY this matters:
+#   A tweet with 50 RTs after 2 minutes is FAR more significant than
+#   one with 500 RTs after 6 hours. Velocity, not absolute count, is the signal.
+#   This is how you catch the breaking moment vs. the stale viral tweet.
+```
+
+---
+
+## 3. Unified Data Schema (`ingest/normalizer.py`)
+
+Every data source must be converted to this common schema before storage:
+
+```python
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional
+
+@dataclass
+class NewsItem:
+    # Identity
+    id: str                          # SHA256 of source + original_id
+    source_type: str                 # "x_tweet" | "finnhub" | "polygon" | "newsapi" | "eodhd" | "calendar"
+    source_name: str                 # "@DeItaone" | "finnhub_general" | "polygon_news" | etc.
+    original_id: str                 # Tweet ID, article ID, etc.
+
+    # Content
+    headline: str                    # Tweet text or article title (max 500 chars)
+    body: Optional[str] = None       # Article summary/description if available
+    url: Optional[str] = None        # Link to original
+
+    # Temporal
+    published_at: datetime = field(default_factory=datetime.utcnow)
+    ingested_at: datetime = field(default_factory=datetime.utcnow)
+
+    # Classification (populated by tagger.py)
+    tickers: list[str] = field(default_factory=list)     # ["AAPL", "TSLA"]
+    topics: list[str] = field(default_factory=list)       # ["fed", "rates", "earnings"]
+    category: Optional[str] = None   # "macro" | "earnings" | "geopolitical" | "sector" | "company" | "crypto"
+
+    # Engagement (X-specific, 0 for non-X sources)
+    likes: int = 0
+    retweets: int = 0
+    replies: int = 0
+    views: int = 0
+
+    # Scoring (populated by scoring engine)
+    urgency_score: float = 0.0       # 0.0 – 1.0, composite score
+    velocity_score: float = 0.0      # Sub-score: engagement velocity
+    content_score: float = 0.0       # Sub-score: keyword/NLP classification
+    market_score: float = 0.0        # Sub-score: price action cross-reference
+
+    # Source metadata
+    account_tier: Optional[str] = None   # "wire" | "analysis" | "media"
+    credibility: float = 0.5             # From ACCOUNT_RELIABILITY config
+
+    # Dedup
+    cluster_id: Optional[str] = None  # Groups duplicate stories
+    is_primary: bool = True           # True if this is the "best" version in a cluster
+```
+
+---
+
+## 4. Scoring & Trigger Engine — Detailed Logic
+
+### 4A. Content Scoring (`scoring/content.py`)
+
+Classify based on keywords and patterns. First pass — cheap and fast.
+
+```python
+MACRO_CRITICAL = {
+    "emergency meeting": 1.0,
+    "rate cut": 0.85,
+    "rate hike": 0.85,
+    "basis points": 0.7,
+    "quantitative tightening": 0.7,
+    "balance sheet": 0.6,
+    "dot plot": 0.6,
+    "powell": 0.65,
+    "fed chair": 0.65,
+    "nonfarm payrolls": 0.7,
+    "cpi": 0.7,
+    "inflation": 0.6,
+    "gdp": 0.6,
+    "pce": 0.65,
+    "unemployment": 0.55,
+    "retail sales": 0.5,
+    "ism": 0.5,
+    "ppi": 0.5,
+    "jobless claims": 0.45,
+}
+
+EARNINGS_CRITICAL = {
+    "beats": 0.5,
+    "misses": 0.6,       # Misses are more market-moving than beats
+    "guides lower": 0.8,
+    "guides higher": 0.7,
+    "profit warning": 0.85,
+    "revenue miss": 0.65,
+    "revenue beat": 0.5,
+    "raises guidance": 0.7,
+    "cuts guidance": 0.85,
+    "lowers outlook": 0.8,
+    "record revenue": 0.5,
+    "layoffs": 0.6,
+    "restructuring": 0.55,
+}
+
+GEOPOLITICAL_CRITICAL = {
+    "tariff": 0.7,
+    "sanctions": 0.65,
+    "embargo": 0.7,
+    "invasion": 0.8,
+    "military": 0.5,
+    "war": 0.7,
+    "ceasefire": 0.6,
+    "trade war": 0.75,
+    "export controls": 0.6,
+    "opec": 0.6,
+    "oil production": 0.55,
+}
+
+MARKET_STRUCTURE_CRITICAL = {
+    "circuit breaker": 0.95,
+    "trading halt": 0.8,
+    "margin call": 0.7,
+    "liquidation": 0.65,
+    "flash crash": 0.9,
+    "short squeeze": 0.65,
+    "gamma squeeze": 0.6,
+    "bank run": 0.9,
+    "bankruptcy": 0.75,
+    "default": 0.7,
+    "downgrade": 0.6,
+    "upgrade": 0.5,
+}
+
+# ALL-CAPS detection:
+# Wire accounts (@DeItaone, @FirstSquawk) post in ALL CAPS for breaking news.
+# If the entire headline is uppercase AND from a wire account → boost content_score by 0.15
+
+# Source credibility multiplier:
+# content_score = max(matched_keyword_weights) * account_credibility + tier_bonus
+# tier_bonus = 0.1 for Tier 1 ticker mention, 0.05 for Tier 2
+```
+
+### 4B. Velocity Scoring (`scoring/velocity.py`)
+
+Only applies to X/Twitter data. Uses the two-pass approach from Section 2.
+
+```python
+# 1. Retweet velocity (from two-pass re-check)
+#    rt_velocity = (rt_count_t1 - rt_count_t0) / elapsed_minutes
+#    Thresholds:
+#      > 100 RT/min → velocity_score = 1.0
+#      > 50 RT/min  → velocity_score = 0.8
+#      > 20 RT/min  → velocity_score = 0.6
+#      > 10 RT/min  → velocity_score = 0.4
+#      < 10 RT/min  → velocity_score = 0.2
+
+# 2. Cluster density (most important velocity signal)
+#    Count how many tracked accounts post about the same topic within a 3-minute window.
+#    Use fuzzy headline matching (Jaccard similarity > 0.6 on word tokens after removing stopwords).
+#
+#    cluster_size >= 4 accounts → velocity_score = max(velocity_score, 0.9)
+#    cluster_size >= 3 accounts → velocity_score = max(velocity_score, 0.7)
+#    cluster_size >= 2 accounts → velocity_score = max(velocity_score, 0.5)
+#
+#    Cross-source clusters are even stronger:
+#    If cluster includes BOTH X tweets AND news API items → boost by 0.1
+#    (This means the story is confirmed by wire services, not just Twitter chatter)
+
+# 3. Quote-tweet ratio (secondary signal)
+#    High quote-to-RT ratio = people adding commentary = higher significance
+#    quotes / (retweets + 1) > 0.3 → boost velocity_score by 0.1
+```
+
+### 4C. Market Data Cross-Reference (`scoring/market.py`)
+
+Cross-reference news with actual price action using free data sources.
+
+```python
+# Free market data for cross-referencing:
+#
+# yfinance (Python library, free, no API key)
+#   import yfinance as yf
+#   spy = yf.Ticker("SPY")
+#   current = spy.fast_info['last_price']
+#   Use for: quick price checks, intraday moves, VIX level
+#
+# Finnhub quote endpoint (free, real-time US stocks)
+#   GET https://finnhub.io/api/v1/quote?symbol=SPY&token=YOUR_KEY
+#   Returns: c (current), d (change), dp (percent change), h (high), l (low), o (open)
+
+# Market signals to check:
+
+# 1. S&P 500 (SPY as proxy)
+#    |move| > 0.5% in 5 min → market_score = 0.8
+#    |move| > 1.0% in 5 min → market_score = 1.0
+
+# 2. VIX (^VIX)
+#    VIX spike > 10% intraday → market_score = max(market_score, 0.7)
+#    VIX > 25 absolute → market_score = max(market_score, 0.6)
+#    VIX > 30 absolute → market_score = max(market_score, 0.9)
+
+# 3. Individual ticker (if news mentions a specific stock)
+#    |move| > 3% on elevated volume → market_score = 0.7
+#    |move| > 5% → market_score = 0.9
+#    |move| > 10% → market_score = 1.0
+
+# 4. Treasury yields (^TNX = 10Y)
+#    |move| > 5bps in 30 min → market_score = max(market_score, 0.5)
+#    |move| > 10bps in 30 min → market_score = max(market_score, 0.8)
+
+# 5. Dollar index (DX-Y.NYB or UUP as proxy)
+#    |move| > 0.5% intraday → market_score = max(market_score, 0.4)
+```
+
+### 4D. Composite Scoring & Trigger (`scoring/engine.py`)
+
+```python
+# Composite score calculation:
+# urgency_score = (
+#     content_weight * content_score +
+#     velocity_weight * velocity_score +
+#     market_weight * market_score
+# )
+
+# Default weights (tune over time):
+CONTENT_WEIGHT  = 0.40
+VELOCITY_WEIGHT = 0.30
+MARKET_WEIGHT   = 0.30
+
+# Trigger thresholds:
+TRIGGER_IMMEDIATE = 0.85    # Draft + send newsletter immediately
+TRIGGER_BATCH     = 0.60    # Add to next batch (sent every 30 min if queue non-empty)
+TRIGGER_LOG_ONLY  = 0.40    # Store but don't trigger
+
+# Force-trigger events (bypass scoring entirely):
+# - FOMC statement release (30 min after scheduled time)
+# - Tier 1 earnings release
+# - Circuit breaker / trading halt on major index
+# - Any item with content_score = 1.0 AND cluster_density >= 3
+
+# Cooldown: Don't trigger more than 1 immediate newsletter per 15 minutes
+# (aggregate items into a single issue if multiple triggers fire in the window)
+```
+
+---
+
+## 5. Newsletter Drafting via Claude API
+
+### 5A. Context Assembly (`newsletter/assembler.py`)
+
+```python
+def assemble_context(triggered_items: list[NewsItem], db) -> str:
+    """
+    Build a token-efficient context window for the Claude API call.
+    Target: < 3000 tokens of context to leave room for the draft.
+    """
+    sections = []
+
+    # 1. Breaking items (what triggered this newsletter)
+    sections.append("## BREAKING DEVELOPMENTS\n")
+    for item in sorted(triggered_items, key=lambda x: x.urgency_score, reverse=True)[:5]:
+        sections.append(format_item_for_context(item))
+
+    # 2. Related recent items (past 2 hours, same tickers/topics, score > 0.3)
+    related = db.query_related(triggered_items, hours=2, min_score=0.3)
+    if related:
+        sections.append("\n## RELATED CONTEXT (past 2 hours)\n")
+        for item in related[:5]:
+            sections.append(format_item_for_context(item))
+
+    # 3. Calendar context (if FOMC/earnings are within 24 hours)
+    calendar_ctx = get_calendar_context(db)
+    if calendar_ctx:
+        sections.append(f"\n## UPCOMING EVENTS\n{calendar_ctx}")
+
+    # 4. Market snapshot
+    snapshot = get_market_snapshot()  # SPY, VIX, 10Y, DXY current levels
+    sections.append(f"\n## MARKET SNAPSHOT\n{snapshot}")
+
+    return "\n".join(sections)
+
+
+def format_item_for_context(item: NewsItem) -> str:
+    """Compact format — every token counts."""
+    ticker_str = f" [{', '.join(item.tickers)}]" if item.tickers else ""
+    topic_str = f" ({', '.join(item.topics)})" if item.topics else ""
+    src = f"@{item.source_name}" if item.source_type == "x_tweet" else item.source_name
+    return (
+        f"- [{item.published_at.strftime('%H:%M')} UTC] "
+        f"{src}: {item.headline}{ticker_str}{topic_str} "
+        f"[score: {item.urgency_score:.2f}]"
+    )
+```
+
+### 5B. Claude API Call (`newsletter/drafter.py`)
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()  # Uses ANTHROPIC_API_KEY env var
+
+def draft_newsletter(context: str, newsletter_type: str = "breaking") -> str:
+    system_prompt = NEWSLETTER_PROMPTS[newsletter_type]
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=2000,
+        system=system_prompt,
+        messages=[
+            {"role": "user", "content": context}
+        ]
+    )
+
+    return response.content[0].text
+```
+
+### 5C. Newsletter Prompt Templates (`newsletter/templates.py`)
+
+```python
+NEWSLETTER_PROMPTS = {
+
+    "breaking": """You are a concise financial markets newsletter writer.
+You receive structured context about breaking financial news and must draft a
+short, punchy newsletter issue.
+
+RULES:
+- Lead with the single most impactful headline in bold
+- Follow with 2-3 sentences of context: what happened, why it matters, what to watch next
+- If multiple breaking items, cover each in its own short section (3-5 sentences max)
+- Include a "Market Reaction" line if price data is available
+- Include an "Eyes On" section at the end listing what to watch in the next 24 hours
+- Tone: professional but direct. Think Bloomberg terminal meets Matt Levine.
+- No fluff, no disclaimers, no "this is not financial advice" boilerplate
+- Use markdown formatting
+- Keep the entire newsletter under 500 words
+- If FOMC or major earnings are imminent, mention them in the "Eyes On" section
+
+FORMAT:
+# 🔴 [ONE-LINE SUMMARY OF BIGGEST STORY]
+
+[2-3 sentence explanation]
+
+**Market Reaction:** [SPY/VIX/relevant ticker moves]
+
+---
+## Other Developments
+- **[Headline 2]** — [1-2 sentences]
+- **[Headline 3]** — [1-2 sentences]
+
+---
+## 👀 Eyes On
+- [Upcoming event/data point 1]
+- [Upcoming event/data point 2]
+""",
+
+    "earnings": """You are a concise earnings newsletter writer.
+You receive earnings data and context about a major company's quarterly report.
+
+RULES:
+- Lead with company name, quarter, and the headline number (EPS beat/miss)
+- Compare actuals vs estimates for EPS and revenue
+- Highlight guidance changes (this is often more important than the quarter itself)
+- Note any notable commentary from the earnings call if available
+- Include after-hours/pre-market stock move if available
+- Keep it under 300 words
+- Tone: analytical, no hype
+
+FORMAT:
+# [COMPANY] Q[X] Earnings: [BEAT/MISS] — [Key Takeaway]
+
+| Metric | Actual | Estimate | Surprise |
+|--------|--------|----------|----------|
+| EPS    | $X.XX  | $X.XX    | +X.X%    |
+| Revenue| $XXB   | $XXB     | +X.X%    |
+
+[2-3 sentence analysis of the quarter]
+
+**Guidance:** [Forward guidance summary]
+
+**Stock Reaction:** [After-hours move]
+
+**What It Means:** [1-2 sentences on broader market implications]
+""",
+
+    "fomc": """You are a concise Fed/FOMC newsletter writer.
+You receive context about an FOMC decision or Fed communication.
+
+RULES:
+- Lead with the decision (rate change or hold) and the vote split if available
+- Summarize the statement's key language changes vs previous meeting
+- Highlight dot plot / SEP changes if this is a projection meeting
+- Note any notable press conference quotes
+- Include market reaction (rates, equities, dollar)
+- Keep it under 400 words
+
+FORMAT:
+# 🏦 FOMC: [DECISION SUMMARY]
+
+[2-3 sentence overview of the decision and rationale]
+
+**Key Language Changes:**
+- [Change 1]
+- [Change 2]
+
+**Market Reaction:**
+- Fed Funds Futures: [X]
+- 10Y Yield: [X]
+- SPY: [X]
+- DXY: [X]
+
+**What's Next:** [Forward guidance interpretation, next meeting expectations]
+""",
+
+    "daily_digest": """You are a financial markets daily digest writer.
+You receive a collection of the day's notable news items, scored by significance.
+
+RULES:
+- Group items by category: Macro, Earnings, Sector Moves, Geopolitical
+- Lead each category with the highest-scored item
+- Keep each item to 1-2 sentences
+- End with a "Tomorrow's Calendar" section
+- Keep the entire digest under 600 words
+- Tone: brisk and informational, like a morning briefing
+
+FORMAT:
+# 📊 Markets Daily — [DATE]
+
+## Macro
+- **[Top macro headline]** — [context]
+
+## Earnings
+- **[Top earnings headline]** — [context]
+
+## Movers
+- **[Notable stock/sector move]** — [context]
+
+## 📅 Tomorrow
+- [Event 1] at [time]
+- [Event 2] at [time]
+"""
+}
+```
+
+---
+
+## 6. Delivery Layer — Prioritized
+
+### 6A. Telegram Bot (PRIMARY — real-time alerts)
+
+```python
+# Why Telegram:
+# - Free bot API, no limits on messages
+# - Push notifications on mobile — your phone buzzes when news drops
+# - Supports markdown formatting (our newsletters are already markdown)
+# - Most finance people already have Telegram
+# - Latency: message delivered in <1 second
+#
+# Setup:
+# 1. Create bot via @BotFather on Telegram → get TELEGRAM_BOT_TOKEN
+# 2. Create a channel or group → get TELEGRAM_CHAT_ID
+# 3. Add bot to channel as admin
+#
+# Sending:
+# POST https://api.telegram.org/bot{TOKEN}/sendMessage
+# {
+#   "chat_id": CHAT_ID,
+#   "text": newsletter_markdown,
+#   "parse_mode": "Markdown"
+# }
+#
+# For newsletters > 4096 chars (Telegram's limit):
+# Split into multiple messages at section boundaries (--- markers).
+#
+# Alert types → Telegram formatting:
+# IMMEDIATE trigger: 🔴 prefix, full newsletter
+# BATCH trigger: 🟡 prefix, condensed version
+# Earnings: 📊 prefix
+# FOMC: 🏦 prefix
+# Daily digest: 📰 prefix (sent at 8:00 PM ET daily)
+```
+
+### 6B. Local Web Dashboard (SECONDARY — monitoring & history)
+
+```python
+# A lightweight single-page dashboard served by FastAPI or Flask.
+# NOT a fancy React app. A single HTML file with auto-refresh.
+#
+# Purpose: Let the user see the system working, tune scoring, browse history.
+#
+# Pages / sections:
+#
+# 1. LIVE FEED — Last 50 ingested items, color-coded by urgency_score
+#    Green (< 0.4) | Yellow (0.4-0.6) | Orange (0.6-0.85) | Red (> 0.85)
+#    Each item shows: timestamp, source, headline, score breakdown, tickers
+#
+# 2. NEWSLETTERS — History of all triggered newsletters
+#    Shows: timestamp, type, trigger reason, the full markdown draft, delivery status
+#
+# 3. SYSTEM STATUS — Current polling state (NORMAL/ELEVATED/CRITICAL)
+#    Shows: items ingested today, newsletters triggered today,
+#    API rate limit status per source, last successful poll per source
+#
+# 4. UPCOMING — Next 7 days of FOMC/earnings/macro calendar events
+#    Highlighted by tier (Tier 1 earnings in red, FOMC in blue)
+#
+# 5. SCORING TUNER — Sliders to adjust scoring weights and thresholds
+#    Changes take effect on next cycle without restart.
+#    Shows last 24h of items re-scored with new weights for comparison.
+#
+# Implementation:
+# - FastAPI with Jinja2 templates, or a single HTML page with JS fetch() polling
+# - Auto-refresh every 30 seconds
+# - Serve on localhost:8080 by default
+# - No auth needed (local only). If exposing externally, add basic auth.
+```
+
+### 6C. Email (TERTIARY — daily digest only)
+
+```python
+# Use for the daily digest newsletter, sent once at ~8:00 PM ET.
+# Not for real-time alerts (too slow, no push notification).
+#
+# Options:
+# - SMTP (Gmail with app password, or any SMTP server)
+# - Resend API (free tier: 100 emails/day)
+# - SendGrid (free tier: 100 emails/day)
+#
+# Convert newsletter markdown → HTML email using a simple template.
+# Include inline CSS for email client compatibility.
+```
+
+### 6D. File Dump (ALWAYS ON — fallback)
+
+```python
+# Every newsletter is saved to ./output/newsletters/YYYY-MM-DD-HHMMSS-{type}.md
+# Regardless of whether other delivery channels succeed.
+# This is the audit trail and debugging backstop.
+```
+
+---
+
+## 7. Database Schema (`db/schema.sql`)
+
+```sql
+CREATE TABLE IF NOT EXISTS news_items (
+    id TEXT PRIMARY KEY,
+    source_type TEXT NOT NULL,
+    source_name TEXT NOT NULL,
+    original_id TEXT NOT NULL,
+    headline TEXT NOT NULL,
+    body TEXT,
+    url TEXT,
+    published_at DATETIME NOT NULL,
+    ingested_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    tickers TEXT DEFAULT '[]',           -- JSON array
+    topics TEXT DEFAULT '[]',            -- JSON array
+    category TEXT,
+    account_tier TEXT,                   -- "wire" | "analysis" | "media"
+    credibility REAL DEFAULT 0.5,
+    likes INTEGER DEFAULT 0,
+    retweets INTEGER DEFAULT 0,
+    replies INTEGER DEFAULT 0,
+    views INTEGER DEFAULT 0,
+    urgency_score REAL DEFAULT 0.0,
+    velocity_score REAL DEFAULT 0.0,
+    content_score REAL DEFAULT 0.0,
+    market_score REAL DEFAULT 0.0,
+    cluster_id TEXT,
+    is_primary BOOLEAN DEFAULT 1,
+    raw_json TEXT
+);
+
+CREATE INDEX idx_published_at ON news_items(published_at);
+CREATE INDEX idx_urgency_score ON news_items(urgency_score);
+CREATE INDEX idx_source_type ON news_items(source_type);
+CREATE INDEX idx_cluster_id ON news_items(cluster_id);
+
+-- Velocity re-check queue (for the two-pass RT measurement)
+CREATE TABLE IF NOT EXISTS velocity_queue (
+    tweet_id TEXT PRIMARY KEY,
+    news_item_id TEXT NOT NULL REFERENCES news_items(id),
+    likes_t0 INTEGER NOT NULL,
+    rts_t0 INTEGER NOT NULL,
+    replies_t0 INTEGER NOT NULL,
+    first_seen_at DATETIME NOT NULL,
+    recheck_at DATETIME NOT NULL,        -- When to do the second pass
+    rechecked BOOLEAN DEFAULT 0
+);
+
+CREATE INDEX idx_recheck_at ON velocity_queue(recheck_at);
+
+CREATE TABLE IF NOT EXISTS newsletters (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    newsletter_type TEXT NOT NULL,
+    trigger_items TEXT NOT NULL,          -- JSON array of news_item IDs
+    context_sent TEXT NOT NULL,
+    draft_markdown TEXT NOT NULL,
+    delivered_via TEXT DEFAULT '[]',      -- JSON array: ["telegram", "email", "file"]
+    delivered_at DATETIME
+);
+
+CREATE TABLE IF NOT EXISTS calendar_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type TEXT NOT NULL,             -- "fomc" | "earnings" | "cpi" | "nfp" | "gdp" | etc.
+    event_date DATE NOT NULL,
+    event_time TIME,
+    ticker TEXT,                          -- NULL for macro events
+    description TEXT,
+    metadata TEXT DEFAULT '{}',
+    alerted BOOLEAN DEFAULT 0
+);
+
+CREATE INDEX idx_event_date ON calendar_events(event_date);
+
+CREATE TABLE IF NOT EXISTS poll_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),  -- Singleton row
+    current_state TEXT DEFAULT 'normal',     -- "normal" | "elevated" | "critical"
+    state_since DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_cycle_at DATETIME,
+    items_today INTEGER DEFAULT 0,
+    newsletters_today INTEGER DEFAULT 0
+);
+```
+
+---
+
+## 8. Main Loop (`main.py`)
+
+```python
+"""
+Entry point. Runs the ingest → score → trigger → draft → deliver loop.
+
+Usage:
+    python main.py                  # Run continuous monitoring loop
+    python main.py --once           # Run one cycle and exit (for cron)
+    python main.py --digest         # Force a daily digest now
+    python main.py --dashboard      # Start web dashboard only
+    python main.py --backfill 24    # Backfill last 24 hours of news
+"""
+
+import time
+import argparse
+from config.settings import TRIGGER_IMMEDIATE, TRIGGER_BATCH
+from ingest import x_ingest, news_ingest, calendar_ingest
+from ingest.normalizer import normalize
+from scoring.engine import score_and_trigger
+from newsletter.assembler import assemble_context
+from newsletter.drafter import draft_newsletter
+from delivery import deliver
+from scheduler import get_poll_interval, PollState, update_poll_state
+from db.store import DB
+
+def run_cycle(db: DB):
+    # 1. Check velocity re-check queue first (two-pass RT measurement)
+    pending_rechecks = db.get_pending_velocity_rechecks()
+    if pending_rechecks:
+        x_ingest.recheck_engagement(pending_rechecks, db)
+
+    # 2. Ingest from all sources
+    raw_items = []
+    raw_items += x_ingest.fetch_latest()       # Syndication API → Apify → Scweet fallback
+    raw_items += news_ingest.fetch_latest()     # Finnhub, Polygon, NewsAPI, EODHD
+    raw_items += calendar_ingest.check_upcoming_events()
+
+    # 3. Normalize and store
+    normalized = [normalize(item) for item in raw_items]
+    new_items = db.insert_many(normalized)  # Returns only genuinely new items (deduped)
+
+    if not new_items:
+        return
+
+    # 4. Queue X tweets for velocity re-check (only those scoring > 0.3 on content)
+    x_items = [i for i in new_items if i.source_type == "x_tweet"]
+    for item in x_items:
+        if item.content_score > 0.3:
+            db.queue_velocity_recheck(item, delay_minutes=4)
+
+    # 5. Score all new items
+    scored_items = score_and_trigger(new_items, db)
+
+    # 6. Update polling state based on scores
+    update_poll_state(scored_items, db)
+
+    # 7. Check triggers
+    immediate = [i for i in scored_items if i.urgency_score >= TRIGGER_IMMEDIATE]
+    batch = [i for i in scored_items if TRIGGER_BATCH <= i.urgency_score < TRIGGER_IMMEDIATE]
+
+    # 8. Draft and deliver immediate newsletters
+    if immediate and not db.is_on_cooldown(minutes=15):
+        context = assemble_context(immediate, db)
+        newsletter_type = classify_newsletter_type(immediate)
+        draft = draft_newsletter(context, newsletter_type)
+        deliver(draft, newsletter_type)
+        db.log_newsletter(newsletter_type, immediate, context, draft)
+
+    # 9. Add batch items to queue
+    if batch:
+        db.add_to_batch_queue(batch)
+
+    # 10. Flush batch queue if 30 min elapsed
+    if db.batch_queue_ready(interval_minutes=30):
+        queued = db.flush_batch_queue()
+        context = assemble_context(queued, db)
+        draft = draft_newsletter(context, "breaking")
+        deliver(draft, "breaking")
+        db.log_newsletter("breaking", queued, context, draft)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--digest", action="store_true")
+    parser.add_argument("--dashboard", action="store_true")
+    parser.add_argument("--backfill", type=int, default=0)
+    args = parser.parse_args()
+
+    db = DB()
+    db.initialize()
+
+    if args.dashboard:
+        from delivery.web_dashboard import run_dashboard
+        run_dashboard(db)
+        return
+
+    if args.digest:
+        items = db.get_top_items_today(limit=20)
+        context = assemble_context(items, db)
+        draft = draft_newsletter(context, "daily_digest")
+        deliver(draft, "daily_digest")
+        return
+
+    if args.once:
+        run_cycle(db)
+        return
+
+    # Continuous loop with adaptive polling
+    print("Starting monitoring loop...")
+    while True:
+        try:
+            run_cycle(db)
+        except Exception as e:
+            print(f"Cycle error: {e}")
+
+        interval = get_poll_interval(db)  # Market-hours + state-aware interval
+        time.sleep(interval)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## 9. Configuration (`.env.example`)
+
+```bash
+# ─── X / Twitter (all optional — system uses free Syndication API by default) ───
+APIFY_API_KEY=                          # Apify free tier ($5/mo credit) — fallback
+SCWEET_AUTH_TOKEN=                      # Browser cookie auth token — last resort fallback
+
+# ─── Financial News APIs (all free tiers) ───
+FINNHUB_API_KEY=                        # Required — primary news source
+POLYGON_API_KEY=                        # Recommended — good ticker-level news
+ALPHA_VANTAGE_API_KEY=                  # Optional — sentiment scoring only
+NEWSAPI_API_KEY=                        # Optional — supplement
+EODHD_API_KEY=                          # Optional — supplement
+
+# ─── Claude API ───
+ANTHROPIC_API_KEY=                      # Required — newsletter drafting
+
+# ─── Delivery: Telegram (primary) ───
+TELEGRAM_BOT_TOKEN=                     # From @BotFather
+TELEGRAM_CHAT_ID=                       # Channel or group ID
+
+# ─── Delivery: Email (optional, for daily digest) ───
+DELIVERY_EMAIL_ENABLED=false
+DELIVERY_EMAIL_TO=you@example.com
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=
+SMTP_PASS=
+
+# ─── Scoring Thresholds ───
+TRIGGER_IMMEDIATE=0.85
+TRIGGER_BATCH=0.60
+CONTENT_WEIGHT=0.40
+VELOCITY_WEIGHT=0.30
+MARKET_WEIGHT=0.30
+
+# ─── User Watchlist (comma-separated) ───
+WATCHLIST_TIER_3=SQ,PLTR,SOFI,COIN,MARA
+```
+
+---
+
+## 10. Implementation Priority
+
+Build in this order. Each phase should be independently testable.
+
+### Phase 1 — Skeleton + Single Source (get something working fast)
+1. Set up project structure, SQLite schema, DB helper
+2. Implement Finnhub news ingest (most reliable free source, generous rate limits)
+3. Implement content scorer (keyword matching only)
+4. Implement Claude API newsletter drafter with the `breaking` template
+5. Implement file dump delivery (always-on fallback)
+6. Wire up `main.py --once` to run one full cycle end-to-end
+7. **TEST**: Run once, verify a markdown file appears in `./output/newsletters/`
+
+### Phase 2 — X Integration (the hard part)
+8. Implement Twitter Syndication API fetcher (Tier 1, primary free method)
+9. Implement Apify fallback (Tier 2)
+10. Implement Scweet fallback (Tier 3)
+11. Wire all three behind the `XSource` interface with automatic failover
+12. Add account list from `config/accounts.py`
+13. **TEST**: Run once, verify X tweets from curated accounts appear in the DB
+
+### Phase 3 — Scoring + Adaptive Polling
+14. Add ticker tagger and topic classifier
+15. Add fuzzy dedup (Jaccard similarity on headline tokens)
+16. Implement velocity two-pass re-check (queue + delayed re-fetch)
+17. Implement market data cross-reference scoring (yfinance)
+18. Implement composite scorer with trigger logic
+19. Implement market-hours-aware adaptive polling scheduler
+20. **TEST**: Feed known breaking headlines, verify correct urgency scores
+
+### Phase 4 — Calendar + More News Sources
+21. Add Polygon.io and NewsAPI ingest
+22. Implement earnings calendar ingest (Finnhub)
+23. Implement FOMC calendar (hardcoded dates + Finnhub economic calendar)
+24. Add calendar context to newsletter assembly
+25. Add `earnings` and `fomc` newsletter templates
+26. **TEST**: Verify calendar events show up in "Eyes On" section
+
+### Phase 5 — Delivery (Telegram + Dashboard)
+27. Implement Telegram bot delivery (primary real-time channel)
+28. Implement local web dashboard (FastAPI + single HTML page)
+29. Implement email delivery for daily digest
+30. Add `--digest` mode (scheduled at 8:00 PM ET daily)
+31. Add `--dashboard` mode
+32. **TEST**: Trigger a newsletter, verify it arrives on Telegram within seconds
+
+### Phase 6 — Hardening
+33. Add retry logic with exponential backoff on all API calls
+34. Add rate limit tracking per API source (track remaining calls)
+35. Add cooldown enforcement (max 1 immediate per 15 min)
+36. Add graceful degradation (if X scraping breaks, system continues on news APIs only)
+37. Add logging throughout (structured logs, not print statements)
+38. Write README with setup instructions
+39. **TEST**: Kill the Syndication API (mock it returning errors), verify system degrades to Apify/news APIs
+
+---
+
+## 11. Key Design Decisions
+
+- **Syndication API first, not X's official API.** The free tier of X's API is write-only. The Syndication API is the public endpoint that Twitter's own embed widgets use — it returns ~20 recent tweets per profile, no auth needed. For 15 curated accounts polled every 2 minutes, this is more than sufficient.
+
+- **News APIs are the primary content source, not X.** Finnhub and Polygon push the same breaking headlines that wire accounts on X post, usually within 1-2 minutes. They all source from the same wires (Dow Jones, Reuters, Bloomberg). X's unique value is the velocity/engagement layer on top — how fast people are reacting. Build the system so it works fully on news APIs alone, with X as enrichment.
+
+- **Adaptive polling, not fixed intervals.** Polling every 60 seconds at 3 AM on a Sunday is wasteful. Polling every 60 seconds during FOMC day when VIX is spiking might be too slow. The scheduler should be market-hours aware and escalate automatically when activity spikes.
+
+- **Two-pass velocity measurement.** Don't check RT counts at a fixed interval. Record engagement at first sight, then re-check 4 minutes later. The *rate of change* is the signal, not the absolute number.
+
+- **Telegram over email for real-time.** Email has no push notification for most people. Telegram delivers in under a second with a phone buzz. Email is fine for the end-of-day digest.
+
+- **SQLite, not Postgres.** Single-user tool. SQLite handles hundreds of items/day trivially. Zero config.
+
+- **Keyword scoring first, ML later.** A well-tuned keyword scorer handles 90% of cases. Don't add embeddings or classifiers until the keyword approach demonstrably fails.
+
+- **Dedup aggressively.** The same headline will hit 3-5 sources within minutes. Jaccard similarity > 0.6 on word tokens, within a 5-minute window. Keep the version with the most metadata as primary.
+
+- **Respect rate limits religiously.** Track remaining calls per source. If exhausted, skip silently and try next cycle. Never crash on a 429.
+
+- **Store everything.** Even items below trigger threshold. You need the history for backtesting scoring weights and for the daily digest.
+
+- **Graceful degradation.** If X scraping breaks entirely (which it will periodically), the system should continue running on news APIs alone with zero manual intervention. Log a warning, not an exception.
